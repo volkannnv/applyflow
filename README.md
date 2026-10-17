@@ -1,6 +1,6 @@
 # ApplyFlow
 
-Kullanıcı hesabına özel iş başvurusu ve mülakat takip uygulaması. React, TypeScript, Vite ve Tailwind CSS arayüzü; Node.js HTTP API ve SQLite veritabanı kullanır.
+Kullanıcı hesabına özel iş başvurusu ve mülakat takip uygulaması. React, TypeScript, Vite ve Tailwind CSS arayüzü; Node.js HTTP API kullanır. Yerelde SQLite, Render üzerinde PostgreSQL ile çalışır.
 
 ## Geliştirme
 
@@ -42,7 +42,7 @@ pnpm start
 
 ## Veritabanı ve yalıtım
 
-`data/applyflow.sqlite` ilk çalıştırmada oluşur. Şema `server/schema.sql` dosyasındadır ve yeniden başlatmalarda mevcut kayıtlar korunur.
+`DATABASE_URL` verilmezse yerelde `data/applyflow.sqlite` ilk çalıştırmada oluşur. SQLite şeması `server/schema.sql`, PostgreSQL şeması `server/schema.postgres.sql` dosyasındadır. `DATABASE_URL` tanımlıysa PostgreSQL kullanılır; bağlantı başarısızsa SQLite'a geçilmez. Üretimde `DATABASE_URL` zorunludur. Tablolar sunucu başlatılırken otomatik oluşturulur; ayrı migration komutu gerekmez.
 
 | Tablo          | İçerik                                                  |
 | -------------- | ------------------------------------------------------- |
@@ -75,17 +75,35 @@ Kullanıcı başvurularını JSON olarak indirebilir. Tüm kullanıcıları içe
 
 ## Yayınlama
 
-Bu sürüm yalnızca statik Netlify yüklemesiyle çalışmaz. **Node.js 24+ ve kalıcı disk** sunan bir barındırma gerekir. Tek sunucuda `pnpm build` ardından `pnpm start` ile arayüz ve API aynı kaynaktan sunulur. Üretim ortamı:
+Bu sürüm yalnızca statik dosya yüklemesiyle çalışmaz. **Node.js 24+ ve PostgreSQL** gerekir. `pnpm build` ardından `pnpm start` ile arayüz ve API aynı kaynaktan sunulur.
+
+### Render üzerinde ücretsiz demo
+
+1. [Render](https://dashboard.render.com/) hesabını GitHub'a bağlayın.
+2. **New → Blueprint** seçip bu depoyu ve `main` dalını seçin. Dosya yolu `render.yaml` olarak kalsın.
+3. Listelenen `applyflow` Web Service ve `applyflow-db` PostgreSQL için planların **Free** olduğunu doğrulayıp oluşturun. Mevcut bir ücretsiz PostgreSQL varsa Render'ın tek ücretsiz veritabanı sınırını dikkate alın.
+4. Blueprint veritabanı bağlantısını `DATABASE_URL` olarak otomatik aktarır. İki kaynak Frankfurt bölgesindedir; veritabanı yalnızca Render'ın özel ağına açıktır. Şifreyi dosyaya veya GitHub'a eklemeyin.
+5. Uygulama **Live** olduğunda Web Service sayfasındaki HTTPS bağlantısını açın. Render'ın `RENDER_EXTERNAL_URL` değeri izin verilen istek kaynağı olarak otomatik kullanılır. Kendi alan adınız varsa `APP_ORIGINS` ile izin verilen HTTPS adreslerini ayrıca tanımlayın.
+6. Hesap oluşturun, başvuru kaydedin, sayfayı yenileyin ve çıkıp tekrar giriş yapın. Servisi yeniden başlatıp kayıtların durduğunu kontrol edin. `/api/health` veritabanı bağlantısını da denetler.
+
+Ücretsiz Web Service 15 dakika trafik almazsa uyur; tekrar açılması yaklaşık bir dakika sürebilir. PostgreSQL'deki veriler bu uykudan etkilenmez. Ücretsiz PostgreSQL oluşturulduktan **30 gün sonra sona erer** ve ücretsiz yedekleme sunmaz. Değerlendirmeden önce JSON yedeği alın; JSON yalnızca başvuruları içerir, kullanıcı hesaplarını ve oturumları içermez. Değerlendirme bitince iki kaynağı Render panelinden silebilirsiniz.
+
+Kaynaklar: [Render ücretsiz plan](https://render.com/docs/free), [Blueprint kurulumu](https://render.com/docs/infrastructure-as-code), [PostgreSQL bağlantısı](https://render.com/docs/postgresql-creating-connecting).
+
+### Elle Web Service oluşturma
+
+Blueprint yerine **New → Postgres** ile Free veritabanı oluşturup aynı bölgede **New → Web Service** ile depoyu bağlayabilirsiniz. Build: `pnpm install --frozen-lockfile --prod=false && pnpm test && pnpm build`; Start: `pnpm start`; sağlık yolu: `/api/health`. İki kaynak için de **Free** seçin. `DATABASE_URL` değerine PostgreSQL sayfasındaki **Internal Database URL** bilgisini girin. Ortam:
 
 ```dotenv
 NODE_ENV=production
+NODE_VERSION=24
 HOST=0.0.0.0
-PORT=3001
-DATABASE_PATH=/persistent-volume/applyflow.sqlite
-APP_ORIGINS=https://uygulamanizin-alan-adi.example
+DATABASE_URL=postgresql://KULLANICI:PAROLA@DAHILI_HOST:5432/VERITABANI
+# Render dışında zorunlu; Render'da RENDER_EXTERNAL_URL otomatik kullanılır.
+# APP_ORIGINS=https://uygulamanizin-alan-adi.example
 ```
 
-TLS sonlandıran reverse proxy kullanın; HTTPS Origin adreslerini virgülle, sonunda `/` olmadan yazın. Kalıcı diski `DATABASE_PATH` için bağlayın; geçici dağıtım diski kullanmayın. Tek Node.js uygulama örneği çalıştırın. `APP_ORIGINS` üretimde zorunludur ve HTTPS olmalıdır. Proxy arkasında hız sınırı doğrudan bağlantı IP'sini kullanır; istemci IP başlıklarına otomatik güvenilmez. Bu sürüm henüz internete yayımlanmamıştır.
+Render HTTPS ve `PORT` değerini sağlar; ayrıca disk bağlamayın. HTTPS Origin adreslerini virgülle, sonunda `/` olmadan yazın. Proxy arkasında hız sınırı doğrudan bağlantı IP'sini kullanır; istemci IP başlıklarına otomatik güvenilmez. Yerel SQLite kayıtları kendiliğinden PostgreSQL'e taşınmaz. Başvuruları yerelden JSON olarak dışa aktarın; canlıda hesap oluşturup içe aktarın.
 
 E-posta doğrulama, e-posta ile parola sıfırlama, sosyal giriş ve AI entegrasyonu bu sürümde yoktur. E-posta sahipliği doğrulanmaz; adres giriş tanımlayıcısıdır. Mülakat saatleri cihazın yerel saatidir. Birden fazla cihazdan erişim aynı sunucuya bağlanıldığında mümkündür; yerel `127.0.0.1` adresi başka cihazlara açılmaz.
 
@@ -93,7 +111,9 @@ E-posta doğrulama, e-posta ile parola sıfırlama, sosyal giriş ve AI entegras
 
 `pnpm test`: doğrulama, kayıt/giriş, oturum iptali ve süresi, parola değiştirme, kullanıcı yalıtımı, eşzamanlı yazma çatışması, atomik yazma, hız sınırı ve SQLite kalıcılığı. API testleri geçici veritabanı kullanır; kişisel veritabanına dokunmaz.
 
-- `server/`: HTTP API, oturumlar ve SQLite şeması
+PostgreSQL API testleri için `TEST_DATABASE_URL` değişkenini bir test PostgreSQL bağlantısına ayarlayıp `pnpm test` çalıştırın. Testler her senaryo için rastgele, ayrı bir şema oluşturup temizler. Bağlantı kullanıcısının şema oluşturma izni olmalıdır. `DATABASE_URL` testlerde kullanılmaz.
+
+- `server/`: HTTP API, oturumlar, SQLite/PostgreSQL bağlantıları ve şemalar
 - `scripts/`: geliştirme sunucularını birlikte çalıştırma
 - `src/Components`: başvuru formu, kart ve hesap ayarları
 - `src/Pages`: pano, takvim, istatistik ve çalışma alanı

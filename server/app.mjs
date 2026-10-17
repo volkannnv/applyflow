@@ -1,8 +1,8 @@
 import { createServer } from 'node:http';
-import { DatabaseSync } from 'node:sqlite';
+import { createSqliteDatabase } from './database.mjs';
 import { randomBytes, randomUUID, createHash, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
-import { readFileSync, existsSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, statSync, createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, extname, sep } from 'node:path';
 import { isApplication, safeUrl } from '../src/lib/model.ts';
@@ -75,29 +75,27 @@ export function validateApplications(items) {
 }
 export function createApp({
   databasePath = ':memory:',
+  database,
   origins = ['http://127.0.0.1:5173'],
   secureCookies = false,
   serveStatic = false,
   authLimit = 20,
 } = {}) {
-  const db = new DatabaseSync(databasePath);
-  db.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
+  const db = database ?? createSqliteDatabase(databasePath);
   const limiter = new Map();
   // A dummy hash makes nonexistent-account login perform the same password work.
   const dummyHash = hashPassword(randomBytes(32).toString('hex'));
   const cookie = (token, age = sessionLifetime) =>
     `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}${secureCookies ? '; Secure' : ''}`;
-  function createSession(userId) {
+  async function createSession(userId) {
     const token = randomBytes(32).toString('base64url');
-    db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
-    db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').run(
-      digest(token),
-      userId,
-      Date.now() + sessionLifetime * 1000,
-    );
+    await db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+    await db
+      .prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)')
+      .run(digest(token), userId, Date.now() + sessionLifetime * 1000);
     return cookie(token);
   }
-  function authenticate(req) {
+  async function authenticate(req) {
     const token = req.headers.cookie
       ?.split(';')
       .map((s) => s.trim())
@@ -105,17 +103,17 @@ export function createApp({
       ?.slice(cookieName.length + 1);
     if (!token || token.length > 100) return null;
     return (
-      db
+      (await db
         .prepare(
           'SELECT users.*, sessions.token_hash FROM sessions JOIN users ON users.id=sessions.user_id WHERE token_hash=? AND expires_at>?',
         )
-        .get(digest(token), Date.now()) ?? null
+        .get(digest(token), Date.now())) ?? null
     );
   }
-  function list(userId) {
-    return db
+  function list(userId, connection = db) {
+    return connection
       .prepare(
-        `SELECT id,company,role,location,work_type AS workType,stage,application_date AS date,interview_at AS interviewAt,url,notes,color FROM applications WHERE user_id=? ORDER BY position`,
+        `SELECT id,company,role,location,work_type AS "workType",stage,application_date AS date,interview_at AS "interviewAt",url,notes,color FROM applications WHERE user_id=? ORDER BY position`,
       )
       .all(userId);
   }
@@ -168,7 +166,10 @@ export function createApp({
         )
           throw httpError(403, 'İstek kaynağı doğrulanamadı.');
       }
-      if (path === '/api/health' && req.method === 'GET') return send(200, { ok: true });
+      if (path === '/api/health' && req.method === 'GET') {
+        await db.prepare('SELECT 1').get();
+        return send(200, { ok: true });
+      }
       if (
         ['/api/auth/register', '/api/auth/login', '/api/auth/password'].includes(path) &&
         req.method === 'POST'
@@ -197,18 +198,15 @@ export function createApp({
         const hash = await hashPassword(password);
         const user = { id: randomUUID(), email: normalized, name: name.trim() };
         try {
-          db.prepare('INSERT INTO users(id,email,name,password_hash) VALUES(?,?,?,?)').run(
-            user.id,
-            user.email,
-            user.name,
-            hash,
-          );
+          await db
+            .prepare('INSERT INTO users(id,email,name,password_hash) VALUES(?,?,?,?)')
+            .run(user.id, user.email, user.name, hash);
         } catch (e) {
-          if (e.code?.startsWith('ERR_SQLITE'))
+          if (e.code === '23505' || (e.code === 'ERR_SQLITE_ERROR' && e.errcode === 2067))
             throw httpError(409, 'Bu e-posta ile hesap oluşturulamadı. Giriş yapmayı dene.');
           throw e;
         }
-        return send(201, { user }, { 'Set-Cookie': createSession(user.id) });
+        return send(201, { user }, { 'Set-Cookie': await createSession(user.id) });
       }
       if (path === '/api/auth/login' && req.method === 'POST') {
         const { email, password } = await readJson(req);
@@ -219,19 +217,23 @@ export function createApp({
           password.length > 128
         )
           throw httpError(400, 'E-posta ve parolanı kontrol et.');
-        const user = db
+        const user = await db
           .prepare('SELECT * FROM users WHERE email=?')
           .get(email.trim().toLowerCase());
         if (!(await verifyPassword(password, user?.password_hash ?? (await dummyHash))) || !user)
           throw httpError(401, 'E-posta veya parola hatalı.');
-        return send(200, { user: publicUser(user) }, { 'Set-Cookie': createSession(user.id) });
+        return send(
+          200,
+          { user: publicUser(user) },
+          { 'Set-Cookie': await createSession(user.id) },
+        );
       }
-      const user = authenticate(req);
+      const user = await authenticate(req);
       if (!user) throw httpError(401, 'Devam etmek için giriş yap.');
       if (path === '/api/auth/me' && req.method === 'GET')
         return send(200, { user: publicUser(user) });
       if (path === '/api/auth/logout' && req.method === 'POST') {
-        db.prepare('DELETE FROM sessions WHERE token_hash=?').run(user.token_hash);
+        await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(user.token_hash);
         return send(200, { ok: true }, { 'Set-Cookie': cookie('', 0) });
       }
       if (path === '/api/auth/password' && req.method === 'POST') {
@@ -245,31 +247,35 @@ export function createApp({
         if (!(await verifyPassword(currentPassword, user.password_hash)))
           throw httpError(400, 'Mevcut parola hatalı.');
         const hash = await hashPassword(newPassword);
-        db.exec('BEGIN IMMEDIATE');
-        try {
-          const changed = db
+        await db.transaction(async (connection) => {
+          const changed = await connection
             .prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?')
             .run(hash, user.id, user.password_hash);
           if (!changed.changes)
             throw httpError(409, 'Parolan başka bir oturumda değişti. Yeniden giriş yap.');
-          db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id);
-          db.exec('COMMIT');
-        } catch (e) {
-          db.exec('ROLLBACK');
-          throw e;
-        }
-        return send(200, { ok: true }, { 'Set-Cookie': createSession(user.id) });
+          await connection.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id);
+        });
+        return send(200, { ok: true }, { 'Set-Cookie': await createSession(user.id) });
       }
-      if (path === '/api/applications' && req.method === 'GET')
-        return send(200, { applications: list(user.id), revision: user.revision });
+      if (path === '/api/applications' && req.method === 'GET') {
+        const snapshot = await db.transaction(
+          async (connection) => {
+            const owner = await connection
+              .prepare('SELECT revision FROM users WHERE id=?')
+              .get(user.id);
+            return { applications: await list(user.id, connection), revision: owner.revision };
+          },
+          { readOnly: true },
+        );
+        return send(200, snapshot);
+      }
       if (path === '/api/applications' && req.method === 'PUT') {
         const body = await readJson(req);
         const items = validateApplications(body.applications);
         if (!Number.isSafeInteger(body.revision) || body.revision < 0)
           throw httpError(400, 'Geçersiz kayıt sürümü.');
-        db.exec('BEGIN IMMEDIATE');
-        try {
-          const result = db
+        const saved = await db.transaction(async (connection) => {
+          const result = await connection
             .prepare('UPDATE users SET revision=revision+1 WHERE id=? AND revision=?')
             .run(user.id, body.revision);
           if (!result.changes)
@@ -277,12 +283,12 @@ export function createApp({
               409,
               'Başvurular başka bir sekmede değişti. Son verileri yeniden yükleyip işlemi tekrarla.',
             );
-          db.prepare('DELETE FROM applications WHERE user_id=?').run(user.id);
-          const insert = db.prepare(
+          await connection.prepare('DELETE FROM applications WHERE user_id=?').run(user.id);
+          const insert = connection.prepare(
             'INSERT INTO applications(user_id,id,company,role,location,work_type,stage,application_date,interview_at,url,notes,color,position) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
           );
-          items.forEach((a, i) =>
-            insert.run(
+          for (const [i, a] of items.entries()) {
+            await insert.run(
               user.id,
               a.id,
               a.company.trim(),
@@ -296,14 +302,11 @@ export function createApp({
               a.notes,
               a.color,
               i,
-            ),
-          );
-          db.exec('COMMIT');
-        } catch (e) {
-          db.exec('ROLLBACK');
-          throw e;
-        }
-        return send(200, { applications: list(user.id), revision: body.revision + 1 });
+            );
+          }
+          return { applications: await list(user.id, connection), revision: body.revision + 1 };
+        });
+        return send(200, saved);
       }
       throw httpError(404, 'İşlem bulunamadı.');
     } catch (e) {
@@ -317,5 +320,5 @@ export function createApp({
   });
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
-  return { server, db };
+  return { server, db: db.raw ?? db, database: db, closeDatabase: () => db.close() };
 }

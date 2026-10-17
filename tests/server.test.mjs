@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { createApp } from '../server/app.mjs';
+import { createPostgresDatabase } from '../server/database.mjs';
+import { randomUUID } from 'node:crypto';
 const origin = 'http://127.0.0.1:5173';
 const password = 'test-only-long-password-42';
 const application = {
@@ -21,17 +23,50 @@ const application = {
   color: '#287565',
 };
 async function fixture(t, options = {}) {
-  const app = createApp({ origins: [origin], ...options });
+  let database;
+  let databaseUrl;
+  let cleanup = async () => {};
+  if (process.env.TEST_DATABASE_URL) {
+    const { Pool } = await import('pg');
+    const admin = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    const schema = 'test_' + randomUUID().replaceAll('-', '');
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.TEST_DATABASE_URL);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    databaseUrl = url.toString();
+    cleanup = async () => {
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    };
+    try {
+      database = await createPostgresDatabase(url.toString());
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
+  }
+  let app = createApp({ origins: [origin], database, ...options });
   app.server.listen(0, '127.0.0.1');
   await once(app.server, 'listening');
   t.after(async () => {
     app.server.closeAllConnections();
     await new Promise((resolve) => app.server.close(resolve));
-    app.db.close();
+    await app.closeDatabase();
+    await cleanup();
   });
-  const base = `http://127.0.0.1:${app.server.address().port}`;
+  let base = `http://127.0.0.1:${app.server.address().port}`;
   return {
     ...app,
+    async restart() {
+      app.server.closeAllConnections();
+      await new Promise((resolve) => app.server.close(resolve));
+      await app.closeDatabase();
+      database = await createPostgresDatabase(databaseUrl);
+      app = createApp({ origins: [origin], database, ...options });
+      app.server.listen(0, '127.0.0.1');
+      await once(app.server, 'listening');
+      base = `http://127.0.0.1:${app.server.address().port}`;
+    },
     async request(path, { method = 'GET', body, cookie, headers = {} } = {}) {
       const response = await fetch(base + '/api' + path, {
         method,
@@ -69,13 +104,13 @@ test('accounts are isolated, writes are atomic, stale revisions cannot overwrite
     b = await register(f, 'b@example.test');
   assert.match(a.rawCookie, /HttpOnly/);
   assert.match(a.rawCookie, /SameSite=Lax/);
-  const stored = f.db
+  const stored = await f.db
     .prepare('SELECT password_hash FROM users WHERE email=?')
     .get('a@example.test');
   assert.notEqual(stored.password_hash, password);
   assert.ok(stored.password_hash.includes(':'));
   assert.notEqual(
-    f.db.prepare('SELECT token_hash FROM sessions LIMIT 1').get().token_hash,
+    (await f.db.prepare('SELECT token_hash FROM sessions LIMIT 1').get()).token_hash,
     a.cookie.split('=')[1],
   );
   const save = await f.request('/applications', {
@@ -233,7 +268,7 @@ test('login, expiration, logout, password change and CSRF checks', async (t) => 
   assert.equal(newLogin.status, 200);
   await f.request('/auth/logout', { method: 'POST', cookie: newLogin.cookie, body: {} });
   assert.equal((await f.request('/auth/me', { cookie: newLogin.cookie })).status, 401);
-  f.db.prepare('UPDATE sessions SET expires_at=0').run();
+  await f.db.prepare('UPDATE sessions SET expires_at=0').run();
   assert.equal((await f.request('/auth/me', { cookie: changed.cookie })).status, 401);
 });
 test('auth attempts are rate limited and production cookies are secure', async (t) => {
@@ -250,6 +285,73 @@ test('auth attempts are rate limited and production cookies are secure', async (
     429,
   );
 });
+test('duplicate accounts are rejected and concurrent writes have exactly one winner', async (t) => {
+  const f = await fixture(t);
+  const a = await register(f);
+  assert.equal(
+    (
+      await f.request('/auth/register', {
+        method: 'POST',
+        body: { email: 'A@EXAMPLE.TEST', name: 'Duplicate', password },
+      })
+    ).status,
+    409,
+  );
+  const writes = await Promise.all(
+    ['First', 'Second'].map((notes) =>
+      f.request('/applications', {
+        method: 'PUT',
+        cookie: a.cookie,
+        body: { applications: [{ ...application, notes }], revision: 0 },
+      }),
+    ),
+  );
+  assert.deepEqual(writes.map((r) => r.status).sort(), [200, 409]);
+  const winner = writes.find((r) => r.status === 200);
+  const current = await f.request('/applications', { cookie: a.cookie });
+  assert.deepEqual(current.data, winner.data);
+});
+test('a database constraint failure rolls back the whole transaction', async (t) => {
+  const f = await fixture(t);
+  const a = await register(f);
+  await assert.rejects(
+    f.database.transaction(async (connection) => {
+      await connection
+        .prepare('UPDATE users SET revision=revision+1 WHERE id=?')
+        .run(a.data.user.id);
+      await connection
+        .prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)')
+        .run('test-token', 'nonexistent-user', Date.now());
+    }),
+  );
+  assert.equal((await f.request('/applications', { cookie: a.cookie })).data.revision, 0);
+  assert.equal(
+    await f.db.prepare('SELECT * FROM sessions WHERE token_hash=?').get('test-token'),
+    undefined,
+  );
+});
+test(
+  'PostgreSQL accounts, sessions and records survive an app restart',
+  {
+    skip: !process.env.TEST_DATABASE_URL,
+  },
+  async (t) => {
+    const f = await fixture(t);
+    const a = await register(f);
+    const saved = await f.request('/applications', {
+      method: 'PUT',
+      cookie: a.cookie,
+      body: { applications: [application], revision: 0 },
+    });
+    assert.equal(saved.status, 200);
+    await f.restart();
+    assert.equal(
+      (await f.request('/auth/me', { cookie: a.cookie })).data.user.email,
+      'a@example.test',
+    );
+    assert.deepEqual((await f.request('/applications', { cookie: a.cookie })).data, saved.data);
+  },
+);
 test('records persist after the SQLite connection is reopened', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'applyflow-test-'));
   const path = join(dir, 'test.sqlite');
