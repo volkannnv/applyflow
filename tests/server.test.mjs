@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -57,6 +57,9 @@ async function fixture(t, options = {}) {
   let base = `http://127.0.0.1:${app.server.address().port}`;
   return {
     ...app,
+    get baseUrl() {
+      return base;
+    },
     async restart() {
       app.server.closeAllConnections();
       await new Promise((resolve) => app.server.close(resolve));
@@ -352,6 +355,31 @@ test(
     assert.deepEqual((await f.request('/applications', { cookie: a.cookie })).data, saved.data);
   },
 );
+test('static pages and assets are served when the root has a trailing separator', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'applyflow-static-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, 'assets'));
+  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>ApplyFlow</title>');
+  writeFileSync(join(dir, 'assets/app.js'), 'console.log("ApplyFlow");');
+  writeFileSync(join(dir, 'assets/app.css'), 'body { color: green; }');
+  const f = await fixture(t, { serveStatic: true, staticRoot: dir + '/' });
+  for (const [path, type, content] of [
+    ['/', 'text/html', 'ApplyFlow'],
+    ['/workspace', 'text/html', 'ApplyFlow'],
+    ['/assets/app.js', 'text/javascript', 'console.log'],
+    ['/assets/app.css', 'text/css', 'color: green'],
+  ]) {
+    const response = await fetch(f.baseUrl + path);
+    assert.equal(response.status, 200, path);
+    assert.ok(response.headers.get('content-type').startsWith(type));
+    assert.ok((await response.text()).includes(content));
+  }
+  const head = await fetch(f.baseUrl + '/', { method: 'HEAD' });
+  assert.equal(head.status, 200);
+  assert.equal(await head.text(), '');
+  const traversal = await fetch(f.baseUrl + '/%2e%2e%2fprivate.txt');
+  assert.equal(traversal.status, 404);
+});
 test('records persist after the SQLite connection is reopened', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'applyflow-test-'));
   const path = join(dir, 'test.sqlite');

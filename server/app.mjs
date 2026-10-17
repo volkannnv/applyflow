@@ -79,9 +79,11 @@ export function createApp({
   origins = ['http://127.0.0.1:5173'],
   secureCookies = false,
   serveStatic = false,
+  staticRoot = root,
   authLimit = 20,
 } = {}) {
   const db = database ?? createSqliteDatabase(databasePath);
+  const publicRoot = resolve(staticRoot);
   const limiter = new Map();
   // A dummy hash makes nonexistent-account login perform the same password work.
   const dummyHash = hashPassword(randomBytes(32).toString('hex'));
@@ -133,10 +135,10 @@ export function createApp({
       if (!path.startsWith('/api/')) {
         if (!serveStatic || !['GET', 'HEAD'].includes(req.method))
           throw httpError(404, 'Sayfa bulunamadı.');
-        let file = resolve(root, '.' + decodeURIComponent(path));
-        if (file !== root && !file.startsWith(root + sep))
+        let file = resolve(publicRoot, '.' + decodeURIComponent(path));
+        if (file !== publicRoot && !file.startsWith(publicRoot + sep))
           throw httpError(404, 'Sayfa bulunamadı.');
-        if (!existsSync(file) || !statSync(file).isFile()) file = resolve(root, 'index.html');
+        if (!existsSync(file) || !statSync(file).isFile()) file = resolve(publicRoot, 'index.html');
         if (!existsSync(file)) throw httpError(404, 'Önce pnpm build komutunu çalıştır.');
         const types = {
           '.html': 'text/html; charset=utf-8',
