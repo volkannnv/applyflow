@@ -75,9 +75,18 @@ function postgresStatements(connection) {
   };
 }
 
-export async function createPostgresDatabase(connectionString) {
+export async function createPostgresDatabase(
+  connectionString,
+  { schemaPath = new URL('./schema.postgres.sql', import.meta.url), max = 5 } = {},
+) {
   const { Pool } = await import('pg');
-  const pool = new Pool({ connectionString, max: 5, connectionTimeoutMillis: 10_000 });
+  const pool = new Pool({
+    connectionString,
+    max,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 10_000,
+    allowExitOnIdle: true,
+  });
   pool.on('error', (error) =>
     console.error('PostgreSQL connection error:', error.code || error.name),
   );
@@ -100,7 +109,19 @@ export async function createPostgresDatabase(connectionString) {
     close: () => pool.end(),
   };
   try {
-    await pool.query(readFileSync(new URL('./schema.postgres.sql', import.meta.url), 'utf8'));
+    // Cold starts can initialize concurrently. Serialize schema creation across instances.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(718314043)');
+      await client.query(readFileSync(schemaPath, 'utf8'));
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   } catch (error) {
     await pool.end();
     throw error;

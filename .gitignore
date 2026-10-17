@@ -6,6 +6,7 @@ dist/
 .env*
 !.env.example
 .sites-runtime/
+.netlify/
 data/
 *.sqlite
 *.sqlite-wal

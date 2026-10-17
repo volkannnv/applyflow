@@ -1,6 +1,6 @@
 # ApplyFlow
 
-Kullanıcı hesabına özel iş başvurusu ve mülakat takip uygulaması. React, TypeScript, Vite ve Tailwind CSS arayüzü; Node.js HTTP API kullanır. Yerelde SQLite, Render üzerinde PostgreSQL ile çalışır.
+Kullanıcı hesabına özel iş başvurusu ve mülakat takip uygulaması. React, TypeScript, Vite ve Tailwind CSS arayüzü; Node.js HTTP API kullanır. Yerelde SQLite, Netlify Functions + Neon veya Render üzerinde PostgreSQL ile çalışır.
 
 ## Geliştirme
 
@@ -49,6 +49,7 @@ pnpm start
 | `users`        | Kimlik, ad, e-posta, parola özeti, kayıt sürümü         |
 | `sessions`     | Oturum anahtarı özeti, kullanıcı ve son kullanma zamanı |
 | `applications` | Kullanıcı kimliğiyle ilişkilendirilmiş başvurular       |
+| `auth_attempts` | IP özetiyle, örnekler arasında paylaşılan giriş denemesi sınırı |
 
 Parolalar rastgele tuzla `scrypt` kullanılarak özetlenir. Rastgele oturum kimliği `HttpOnly`, `SameSite=Lax` çerezindedir; üretimde `Secure` eklenir. Oturum anahtarının yalnızca SHA-256 özeti veritabanına yazılır. Oturum süresi 7 gündür. Giriş/kayıt/parola istekleri IP başına 15 dakikada 20 denemeyle sınırlandırılır.
 
@@ -76,6 +77,27 @@ Kullanıcı başvurularını JSON olarak indirebilir. Tüm kullanıcıları içe
 ## Yayınlama
 
 Bu sürüm yalnızca statik dosya yüklemesiyle çalışmaz. **Node.js 24+ ve PostgreSQL** gerekir. `pnpm build` ardından `pnpm start` ile arayüz ve API aynı kaynaktan sunulur.
+
+### Netlify + Neon (önerilen teslim kurulumu)
+
+Arayüz Netlify CDN'den, `/api/*` istekleri aynı alan adındaki Netlify Function'dan sunulur. Render'a istek gönderilmez. API dinleme portu açmaz; oturumlar, kullanıcılar, başvurular ve giriş denemesi sınırı PostgreSQL'de tutulur. Aynı API yerelde ve Render'da çalışmaya devam eder.
+
+1. Neon'da **Free** proje ve Frankfurt bölgesinde PostgreSQL oluşturun. Ek Auth, Functions veya diğer Neon servisleri gerekmez.
+2. Neon **Connect** penceresinden **Connection pooling** açık olan bağlantı adresini alın. `postgresql://...` ile başlayan adresin tamamını, TLS parametreleriyle birlikte kullanın (`sslmode=require` veya Neon'un verdiği daha güçlü TLS ayarı). `psql` komutunu ve dış tırnakları kopyalamayın.
+3. Netlify'da **Import a Git repository → GitHub** üzerinden bu depoyu, `main` dalını seçin. Depodaki `netlify.toml`, build komutunu `pnpm test && pnpm build`, yayın klasörünü `dist`, Functions klasörünü `netlify/functions`, Node sürümünü 24 olarak ayarlar. Netlify build sırasında bağımlılıkları pnpm ile otomatik kurar. `pnpm start` tanımlamayın.
+4. Yayınlamadan önce **Environment variables** bölümünde `DATABASE_URL` anahtarını oluşturup Neon bağlantı adresini girin. **Free** planda varsayılan tüm kapsamlar uygundur; veritabanı parolasını `VITE_` önekli değişkene, dosyaya veya GitHub'a eklemeyin. Netlify, depodaki yerel `.env` dosyasını otomatik yüklemez.
+5. Deploy edin. Proje oluşturulduktan sonra değişken ekliyorsanız **Project configuration → Environment variables** üzerinden ekleyip yeniden deploy edin. Function runtime sürümü build'deki Node 24'ü izler; ayrıca `NODE_ENV`, `HOST`, `PORT` veya `APP_ORIGINS` ayarlamak gerekmez. Netlify API'si HTTPS istek adresiyle Origin'in aynı olduğunu doğrular. Site adı veya özel alan adı değiştiğinde yeni adres otomatik desteklenir.
+6. **Published / Production deploy** bağlantısını açıp `/api/health` yolunda `{"ok":true}` yanıtını kontrol edin. Hesap oluşturun, başvuru kaydedin, yenileyin, çıkış yapıp yeniden giriş yapın. Ardından başka bir tarayıcıda hesabın kayıtlarını doğrulayın. Teslim adresi `https://<site-adı>.netlify.app` olur; değerlendirenlerin erişebilmesi için site erişiminin herkese açık olduğundan emin olun.
+
+Tablolar ilk API isteğinde otomatik oluşturulur. Aynı anda başlayan Function örneklerinin şema kurulumu PostgreSQL kilidiyle sıraya alınır. Sıcak Function örneği küçük bir bağlantı havuzunu tekrar kullanır; bağlantılar boşta kalınca bırakılır. Giriş denemesi sınırı Function belleğine bağlı değildir; Netlify'ın sağladığı istemci IP'sinin özetiyle veritabanında atomik olarak uygulanır. İstemcinin gönderdiği IP başlıklarına güvenilmez.
+
+Netlify statik arayüzü Render web servisi gibi uyutup yeniden başlatmaz. Functions ve Neon'un ilk isteğinde başlangıç gecikmesi olabilir; gecikmesiz çalışma garantisi yoktur. Ücretsiz planların kota sınırları vardır. Netlify Free kota dolduğunda ek ücret çıkarmak yerine projeleri duraklatır. Teslimden önce **Usage & billing** bölümünü kontrol edin; ücretsiz plan seçili kalsın.
+
+**Mevcut Render verileri:** Yeni Neon veritabanı boştur; hesaplar ve başvurular kendiliğinden taşınmaz. Kullanıcılar başvurularını Render'dan JSON olarak dışa aktarıp yeni sitede hesap açarak içe aktarabilir. Aynı kullanıcı hesaplarını/parolaları korumak için tüm PostgreSQL veritabanını `pg_dump`/`pg_restore` ile taşımak gerekir; yalnızca JSON yedeği hesapları ve oturumları içermez. Tam taşıma sırasında Render'daki yazmaları durdurun, veritabanı yedeğini güvenli ve depo dışında saklayın, Neon'a geri yükleyin ve yeni siteden doğrulayın. Yeni alan adı eski oturum çerezini paylaşmaz; tekrar giriş gerekir. Kayıtlar doğrulanmadan Render kaynaklarını silmeyin.
+
+Sorun giderme: Arayüz açılıyor ama API `503` veriyorsa `DATABASE_URL` değerinin Functions'a ulaştığını ve Neon bağlantısının TLS parametrelerini koruduğunu kontrol edin; Netlify **Functions → api → Logs** bölümüne bakın. Veritabanı adresini veya parolayı loglara/ekran görüntülerine eklemeyin. `/api/health` HTML dönüyorsa en son commit'in deploy edildiğini ve `api` Function'ının paketlendiğini doğrulayın.
+
+Kaynaklar: [Netlify Functions](https://docs.netlify.com/build/functions/overview/), [Node ve paketleme ayarları](https://docs.netlify.com/build/functions/configuration/), [ortam değişkenleri](https://docs.netlify.com/build/functions/environment-variables/), [ücretsiz plan sınırları](https://docs.netlify.com/manage/accounts-and-billing/billing/billing-for-credit-based-plans/credit-based-pricing-plans/).
 
 ### Render üzerinde ücretsiz demo
 
@@ -114,6 +136,8 @@ E-posta doğrulama, e-posta ile parola sıfırlama, sosyal giriş ve AI entegras
 PostgreSQL API testleri için `TEST_DATABASE_URL` değişkenini bir test PostgreSQL bağlantısına ayarlayıp `pnpm test` çalıştırın. Testler her senaryo için rastgele, ayrı bir şema oluşturup temizler. Bağlantı kullanıcısının şema oluşturma izni olmalıdır. `DATABASE_URL` testlerde kullanılmaz.
 
 - `server/`: HTTP API, oturumlar, SQLite/PostgreSQL bağlantıları ve şemalar
+- `netlify/functions/api.mjs`: aynı API'nin Netlify Functions giriş noktası
+- `netlify.toml`: Netlify derleme, paketleme, SPA yönlendirmesi ve güvenlik başlıkları
 - `scripts/`: geliştirme sunucularını birlikte çalıştırma
 - `src/Components`: başvuru formu, kart ve hesap ayarları
 - `src/Pages`: pano, takvim, istatistik ve çalışma alanı

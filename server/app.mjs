@@ -73,7 +73,7 @@ export function validateApplications(items) {
   }
   return items;
 }
-export function createApp({
+export function createApi({
   databasePath = ':memory:',
   database,
   origins = ['http://127.0.0.1:5173'],
@@ -84,7 +84,6 @@ export function createApp({
 } = {}) {
   const db = database ?? createSqliteDatabase(databasePath);
   const publicRoot = resolve(staticRoot);
-  const limiter = new Map();
   // A dummy hash makes nonexistent-account login perform the same password work.
   const dummyHash = hashPassword(randomBytes(32).toString('hex'));
   const cookie = (token, age = sessionLifetime) =>
@@ -119,7 +118,7 @@ export function createApp({
       )
       .all(userId);
   }
-  const server = createServer(async (req, res) => {
+  const handler = async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'same-origin');
     const send = (status, data, headers = {}) => {
@@ -163,7 +162,9 @@ export function createApp({
       if (!['GET', 'HEAD'].includes(req.method)) {
         if (
           req.headers['x-applyflow-request'] !== '1' ||
-          !origins.includes(req.headers.origin) ||
+          !(typeof origins === 'function'
+            ? origins(req.headers.origin, req)
+            : origins.includes(req.headers.origin)) ||
           req.headers['sec-fetch-site'] === 'cross-site'
         )
           throw httpError(403, 'İstek kaynağı doğrulanamadı.');
@@ -176,13 +177,22 @@ export function createApp({
         ['/api/auth/register', '/api/auth/login', '/api/auth/password'].includes(path) &&
         req.method === 'POST'
       ) {
-        const key = req.socket.remoteAddress;
+        const key = digest(req.socket.remoteAddress || 'unknown');
         const now = Date.now();
-        for (const [ip, entry] of limiter) if (entry.until < now) limiter.delete(ip);
-        const entry = limiter.get(key) || { count: 0, until: now + 15 * 60 * 1000 };
-        if (++entry.count > authLimit)
+        await db.prepare('DELETE FROM auth_attempts WHERE expires_at <= ?').run(now);
+        const entry = await db
+          .prepare(
+            `
+          INSERT INTO auth_attempts(ip_hash,attempts,expires_at) VALUES(?,1,?)
+          ON CONFLICT(ip_hash) DO UPDATE SET
+            attempts=CASE WHEN auth_attempts.expires_at <= ? THEN 1 ELSE auth_attempts.attempts+1 END,
+            expires_at=CASE WHEN auth_attempts.expires_at <= ? THEN excluded.expires_at ELSE auth_attempts.expires_at END
+          RETURNING attempts
+        `,
+          )
+          .get(key, now + 15 * 60 * 1000, now, now);
+        if (entry.attempts > authLimit)
           throw httpError(429, 'Çok fazla deneme. 15 dakika sonra tekrar dene.');
-        limiter.set(key, entry);
       }
       if (path === '/api/auth/register' && req.method === 'POST') {
         const { email, name, password } = await readJson(req);
@@ -319,8 +329,14 @@ export function createApp({
         error: status === 500 ? 'Sunucuda bir sorun oluştu. Lütfen tekrar dene.' : e.message,
       });
     }
-  });
+  };
+  return { handler, db: db.raw ?? db, database: db, closeDatabase: () => db.close() };
+}
+
+export function createApp(options = {}) {
+  const api = createApi(options);
+  const server = createServer(api.handler);
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
-  return { server, db: db.raw ?? db, database: db, closeDatabase: () => db.close() };
+  return { ...api, server };
 }

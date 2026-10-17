@@ -31,3 +31,9 @@ CREATE TABLE IF NOT EXISTS applications (
   PRIMARY KEY (user_id, id)
 ) STRICT;
 PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS auth_attempts (
+  ip_hash TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS auth_attempts_expiry ON auth_attempts(expires_at);
